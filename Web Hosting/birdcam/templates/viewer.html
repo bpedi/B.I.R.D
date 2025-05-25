@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>BirdCam Viewer</title>
+    <style>
+        video { width: 640px; height: 480px; border: 1px solid black; }
+    </style>
+</head>
+<body>
+    <h1>Live Webcam Viewer</h1>
+    <video id="remoteVideo" autoplay playsinline></video>
+    <script>
+        async function startViewer() {
+            try {
+                // Create WebRTC peer connection
+                const pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+                const videoElement = document.getElementById('remoteVideo');
+
+                // Handle incoming stream
+                pc.ontrack = event => {
+                    if (event.streams[0]) {
+                        videoElement.srcObject = event.streams[0];
+                        console.log('Received remote stream');
+                    }
+                };
+
+                // Handle ICE candidates
+                pc.onicecandidate = async event => {
+                    if (event.candidate) {
+                        console.log('Sending ICE candidate:', event.candidate);
+                        await fetch('/add_ice_candidate', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ pc_id: pc.pc_id, candidate: event.candidate })
+                        });
+                    }
+                };
+
+                // Create and send offer
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                const response = await fetch('/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sdp: offer.sdp, type: offer.type })
+                });
+                const answer = await response.json();
+                pc.pc_id = answer.pc_id; // Store peer connection ID
+                await pc.setRemoteDescription(new RTCSessionDescription({
+                    sdp: answer.sdp,
+                    type: answer.type
+                }));
+
+                // Fetch and add remote ICE candidates
+                const iceCandidates = await (await fetch(`/get_ice_candidates/${pc.pc_id}`)).json();
+                for (const candidate of iceCandidates) {
+                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                }
+            } catch (error) {
+                console.error('Error starting viewer:', error);
+            }
+        }
+
+        window.onload = startViewer;
+    </script>
+</body>
+</html>
