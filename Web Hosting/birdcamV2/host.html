@@ -1,81 +1,174 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Host Camera - Automated</title>
+    <title>Camera Host - Automated</title>
     <style>
         body { font-family: 'Inter', sans-serif; margin: 20px; background-color: #f0f0f0; display: flex; justify-content: center; align-items: center; min-height: 90vh; }
         .container { background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; }
         h1 { color: #333; margin-bottom: 20px; font-size: 1.8em; }
         #localVideo { border: 2px solid #ddd; width: 100%; max-width: 320px; height: 240px; background-color: #000; border-radius: 8px; margin-bottom: 20px; display: block; margin-left: auto; margin-right: auto; }
+        .button-group {
+            display: flex;
+            flex-wrap: wrap; /* Allow buttons to wrap on smaller screens */
+            justify-content: center;
+            gap: 10px; /* Space between buttons */
+            margin-top: 10px;
+        }
         button {
             padding: 12px 25px;
             font-size: 1.1em;
             cursor: pointer;
-            background-color: #4CAF50;
             color: white;
             border: none;
             border-radius: 8px;
             box-shadow: 0 4px 8px rgba(0,0,0,0.2);
             transition: background-color 0.3s ease, transform 0.2s ease;
-            margin-top: 10px;
+            flex-grow: 1; /* Allow buttons to grow and fill space */
+            min-width: 150px; /* Ensure buttons don't get too small */
         }
-        button:hover {
-            background-color: #45a049;
-            transform: translateY(-2px);
+        button#startButton { background-color: #4CAF50; } /* Green */
+        button#startButton:hover { background-color: #45a049; }
+
+        button#stopButton { background-color: #f44336; } /* Red */
+        button#stopButton:hover { background-color: #da190b; }
+
+        button#switchCameraButton { background-color: #008CBA; } /* Blue */
+        button#switchCameraButton:hover { background-color: #007bb5; }
+
+        button#recordButton { background-color: #FFC107; } /* Orange */
+        button#recordButton:hover { background-color: #e0a800; }
+        button#recordButton.recording {
+            background-color: #dc3545; /* Red when recording */
         }
+        button#recordButton.recording:hover {
+            background-color: #c82333;
+        }
+
         button:active {
             transform: translateY(0);
             box-shadow: 0 2px 5px rgba(0,0,0,0.2);
         }
         .status { margin-top: 20px; font-style: italic; color: #555; font-size: 0.9em; }
+        #messageLog { /* Renamed from errorLog */
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc; /* Changed border color for general messages */
+            background-color: #f9f9f9; /* Lighter background */
+            color: #333; /* Darker text for readability */
+            font-family: monospace;
+            font-size: 0.8em;
+            text-align: left;
+            height: 100px; /* Fixed height for the log */
+            overflow-y: auto; /* Make it scrollable vertically */
+            border-radius: 8px;
+            display: block; /* Always display the log box */
+        }
+        #messageLog .error-message { /* Style for error messages within the log */
+            color: #cc0000;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Camera Host (Auto-Connect)</h1>
         <video id="localVideo" autoplay muted playsinline></video><br>
-        <button id="startButton">Start Camera & Stream</button>
+        <div class="button-group">
+            <button id="startButton">Start Camera & Stream</button>
+            <button id="stopButton">Stop Camera</button>
+            <button id="switchCameraButton">Switch Camera</button>
+            <button id="recordButton">Record Video</button>
+        </div>
         <div id="status" class="status">Status: Idle</div>
-    </div>
+        <div id="messageLog"></div> </div>
 
     <script>
+        // Moved constant declarations to the top
         const localVideo = document.getElementById('localVideo');
         const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const switchCameraButton = document.getElementById('switchCameraButton');
+        const recordButton = document.getElementById('recordButton'); // New record button
         const statusDiv = document.getElementById('status');
+        const messageLogDiv = document.getElementById('messageLog'); // Renamed from errorLogDiv and moved to top
 
         let localStream;
         let pc; // PeerConnection
         let signalingSocket; // WebSocket for signaling
         let viewerIsWaiting = false; // Flag to track if viewer is ready
+        let currentFacingMode = 'user'; // 'user' for front camera, 'environment' for rear
 
-        // IMPORTANT: Replace 'YOUR_COMPUTERS_IP_ADDRESS' with your actual local IP (e.g., 192.168.1.100)
-        // Ensure this matches the IP your phone will use to access the server.
+        let mediaRecorder; // MediaRecorder instance for recording
+        let recordedChunks = []; // Array to store recorded video data chunks
+        let recordingTimeout; // Timeout for 30-second limit
+
+        // IMPORTANT: Hardcoded your IP address
         const SIGNALING_SERVER_IP = '192.168.1.163'; 
         const SIGNALING_SERVER_PORT = 8001; // This is the port for the WebSocket server
 
         // Use 'wss://' because your HTML page is served over HTTPS
         const signalingServerUrl = `wss://${SIGNALING_SERVER_IP}:${SIGNALING_SERVER_PORT}`;
+        // Base URL for API calls to the HTTPS file server
+        const API_BASE_URL = `https://${SIGNALING_SERVER_IP}:${8000}`; // HTTPS server is on port 8000
 
         const configuration = {
             iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         };
 
+        // Function to display messages in the debug box (moved to top)
+        function displayMessage(msg, isError = false) {
+            const messageEntry = document.createElement('p');
+            messageEntry.textContent = `${new Date().toLocaleTimeString()} - ${msg}`;
+            if (isError) {
+                messageEntry.classList.add('error-message');
+            }
+            messageLogDiv.appendChild(messageEntry);
+            messageLogDiv.scrollTop = messageLogDiv.scrollHeight; // Scroll to bottom
+        }
+
+        // Function to update status div and log to console (moved to top)
         function logStatus(msg) {
-            console.log(`HOST: ${msg}`);
+            console.log(`HOST: ${msg}`); // Still log to console for full debug
             statusDiv.textContent = `Status: ${msg}`;
         }
+
+        // Override console.log to also display in the debug box (moved to top)
+        const originalConsoleLog = console.log;
+        console.log = function(message, ...optionalParams) {
+            originalConsoleLog.apply(console, [message, ...optionalParams]);
+            let logMsg = typeof message === 'string' ? message : JSON.stringify(message);
+            if (optionalParams.length > 0) {
+                logMsg += ' ' + optionalParams.map(p => typeof p === 'string' ? p : JSON.stringify(p)).join(' ');
+            }
+            // Only display messages that start with "HOST:" in the log box
+            if (logMsg.startsWith("HOST:")) {
+                displayMessage(logMsg);
+            }
+        };
+
+        // Override console.error to also display in the debug box (moved to top)
+        const originalConsoleError = console.error;
+        console.error = function(message, ...optionalParams) {
+            originalConsoleError.apply(console, [message, ...optionalParams]);
+            let errorMsg = typeof message === 'string' ? message : JSON.stringify(message);
+            if (optionalParams.length > 0) {
+                errorMsg += ' ' + optionalParams.map(p => typeof p === 'string' ? p : JSON.stringify(p)).join(' ');
+            }
+            displayMessage(`ERROR: ${errorMsg}`, true); // Mark as error
+        };
+
 
         // Initialize WebSocket connection
         function initSignalingSocket() {
             if (signalingSocket && (signalingSocket.readyState === WebSocket.OPEN || signalingSocket.readyState === WebSocket.CONNECTING)) {
-                logStatus("WebSocket already connected or connecting.");
+                logStatus("HOST: WebSocket already connected or connecting.");
                 return;
             }
 
             signalingSocket = new WebSocket(signalingServerUrl);
 
             signalingSocket.onopen = () => {
-                logStatus("Connected to signaling server.");
+                logStatus("HOST: Connected to signaling server.");
             };
 
             signalingSocket.onmessage = async (event) => {
@@ -84,15 +177,15 @@
                     // Ignore messages sent by self (if 'from' field is added and matches)
                     if (message.from === 'host') return;
 
-                    logStatus(`Received message type: ${message.type}`);
+                    logStatus(`HOST: Received message type: ${message.type}`);
 
                     // Ensure PC is ready before processing most messages
                     if (!pc || pc.signalingState === 'closed') {
                         if (message.type === 'offer') { // Only re-setup for offer if closed
-                            logStatus("PC was closed. Re-initializing for new offer.");
+                            logStatus("HOST: PC was closed. Re-initializing for new offer.");
                             setupPeerConnection();
                         } else if (message.type !== 'viewer_ready') { // For other messages, if pc is closed, maybe ignore
-                            logStatus(`PC is closed. Ignoring message type: ${message.type}`);
+                            logStatus(`HOST: PC is closed. Ignoring message type: ${message.type}`);
                             return;
                         }
                     }
@@ -101,38 +194,38 @@
                         case 'viewer_ready':
                             // If camera is already active and PC is ready, send offer immediately
                             if (localStream && pc && (pc.signalingState === 'stable' || pc.signalingState === 'have-local-offer')) {
-                                logStatus("Viewer is ready. Camera and PC active. Creating/Resending offer.");
+                                logStatus("HOST: Viewer is ready. Camera and PC active. Creating/Resending offer.");
                                 await createAndSendOffer();
                             } else if (localStream && pc && pc.signalingState === 'closed') {
-                                logStatus("Viewer is ready. PC was closed. Re-initializing PC and sending offer.");
+                                logStatus("HOST: Viewer is ready. PC was closed. Re-initializing PC and sending offer.");
                                 setupPeerConnection();
                                 await createAndSendOffer();
                             } else if (localStream && !pc) { // Stream exists but PC not set up
-                                logStatus("Viewer is ready. Camera active but PC not set up. Setting up PC and sending offer.");
+                                logStatus("HOST: Viewer is ready. Camera active but PC not set up. Setting up PC and sending offer.");
                                 setupPeerConnection();
                                 await createAndSendOffer();
                             } else { // Camera not started yet
-                                logStatus("Viewer is ready, but host camera not active yet. Will send offer once camera starts.");
+                                logStatus("HOST: Viewer is ready, but host camera not active yet. Will send offer once camera starts.");
                                 viewerIsWaiting = true;
                             }
                             break;
                         case 'answer':
                             if (pc && pc.signalingState === "have-local-offer") {
-                                logStatus("Received answer. Setting remote description...");
+                                logStatus("HOST: Received answer. Setting remote description...");
                                 try {
                                     await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
-                                    logStatus("Remote description set successfully.");
+                                    logStatus("HOST: Remote description set successfully.");
                                 } catch (error) {
                                     console.error("HOST: Error setting remote description:", error);
-                                    logStatus(`Error setting remote description: ${error.message}`);
+                                    logStatus(`HOST: Error setting remote description: ${error.message}`);
                                 }
                             } else {
-                                logStatus(`Ignoring answer. PC state is not 'have-local-offer'. Current state: ${pc ? pc.signalingState : 'PC is null'}`);
+                                logStatus(`HOST: Ignoring answer. PC state is not 'have-local-offer'. Current state: ${pc ? pc.signalingState : 'PC is null'}`);
                             }
                             break;
                         case 'candidate':
                             if (message.candidate && pc && pc.signalingState !== 'closed') {
-                                logStatus("Received ICE candidate from viewer. Adding it.");
+                                logStatus("HOST: Received ICE candidate from viewer. Adding it.");
                                 try {
                                     // Reconstruct RTCIceCandidate from plain object
                                     await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
@@ -151,71 +244,230 @@
 
             signalingSocket.onerror = (error) => {
                 console.error("HOST: WebSocket Error:", error);
-                logStatus("Error connecting to signaling server. Check console.");
+                logStatus("HOST: Error connecting to signaling server. Check console.");
             };
 
             signalingSocket.onclose = (event) => {
                 console.log("HOST: WebSocket closed:", event);
-                logStatus(`Disconnected from signaling server. Code: ${event.code}, Reason: ${event.reason}. Reconnecting in 3s...`);
+                logStatus(`HOST: Disconnected from signaling server. Code: ${event.code}, Reason: ${event.reason}. Reconnecting in 3s...`);
                 // Simple reconnect logic
                 setTimeout(initSignalingSocket, 3000);
             };
         }
 
-        startButton.onclick = async () => {
-            logStatus("Requesting camera access...");
+        // Function to start or restart the camera stream
+        async function startCamera(facingMode = currentFacingMode) {
+            logStatus(`HOST: Requesting camera access with facing mode: ${facingMode}...`);
             try {
-                if (localStream) { // If already streaming, stop old tracks before getting new ones
+                // Stop existing tracks if any
+                if (localStream) {
                     localStream.getTracks().forEach(track => track.stop());
                 }
-                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                localVideo.srcObject = localStream;
-                logStatus("Camera active.");
 
-                setupPeerConnection(); // Initialize/re-initialize PC with the new stream
+                // Get new stream with desired facing mode
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: facingMode },
+                    audio: true
+                });
+                localVideo.srcObject = localStream;
+                logStatus("HOST: Camera active.");
+                currentFacingMode = facingMode; // Update current facing mode
+
+                // If PC exists and is not closed, replace tracks
+                if (pc && pc.connectionState !== 'closed') {
+                    const videoTrack = localStream.getVideoTracks()[0];
+                    const audioTrack = localStream.getAudioTracks()[0];
+
+                    // Find existing senders and replace tracks
+                    pc.getSenders().forEach(sender => {
+                        if (sender.track && sender.track.kind === 'video') {
+                            sender.replaceTrack(videoTrack);
+                            logStatus("HOST: Replaced video track in PeerConnection.");
+                        } else if (sender.track && sender.track.kind === 'audio') {
+                            sender.replaceTrack(audioTrack);
+                            logStatus("HOST: Replaced audio track in PeerConnection.");
+                        }
+                    });
+                } else {
+                    // If no PC or it's closed, set up a new one
+                    setupPeerConnection();
+                }
 
                 if (viewerIsWaiting) {
-                    logStatus("Viewer was already waiting. Creating and sending offer now.");
+                    logStatus("HOST: Viewer was already waiting. Creating and sending offer now.");
                     await createAndSendOffer();
                     viewerIsWaiting = false; // Reset flag
                 } else {
-                    logStatus("Host ready. Waiting for viewer to signal readiness.");
+                    logStatus("HOST: Host ready. Waiting for viewer to signal readiness.");
                 }
 
             } catch (error) {
                 console.error("HOST: Error accessing media devices.", error);
-                logStatus(`Error: ${error.message}. Ensure camera permissions are granted.`);
+                logStatus(`HOST: Error: ${error.message}. Ensure camera permissions are granted. Cannot start camera with facing mode: ${facingMode}`);
+            }
+        }
+
+        // Function to stop the camera stream
+        function stopCamera() {
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    track.stop(); // Stop each track
+                    logStatus(`HOST: Stopped track: ${track.kind}`);
+                });
+                localStream = null;
+                localVideo.srcObject = null;
+                logStatus("HOST: Camera stream stopped.");
+            }
+
+            if (pc && pc.connectionState !== 'closed') {
+                pc.close(); // Close the peer connection
+                pc = null;
+                logStatus("HOST: PeerConnection closed.");
+            }
+            logStatus("HOST: Camera and streaming stopped.");
+        }
+
+        // Function to switch between front and rear cameras
+        async function switchCamera() {
+            const newFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
+            await startCamera(newFacingMode);
+        }
+
+        // --- Recording Functionality ---
+        async function startRecording() {
+            if (!localStream) {
+                logStatus("HOST: Cannot start recording: No camera stream active.");
+                return;
+            }
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                logStatus("HOST: Already recording.");
+                return;
+            }
+
+            recordedChunks = []; // Clear previous chunks
+            try {
+                mediaRecorder = new MediaRecorder(localStream);
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        recordedChunks.push(event.data);
+                    }
+                };
+                mediaRecorder.onstop = async () => { // Made onstop async
+                    logStatus("HOST: Recording stopped. Uploading video to server...");
+                    const mimeType = mediaRecorder.mimeType.split(';')[0]; // Get base mime type (e.g., 'video/webm')
+                    const blob = new Blob(recordedChunks, { type: mimeType });
+
+                    // Create timestamped filename
+                    const now = new Date();
+                    const timestamp = now.getFullYear() +
+                                      String(now.getMonth() + 1).padStart(2, '0') +
+                                      String(now.getDate()).padStart(2, '0') + '_' +
+                                      String(now.getHours()).padStart(2, '0') +
+                                      String(now.getMinutes()).padStart(2, '0') +
+                                      String(now.getSeconds()).padStart(2, '0');
+                    const filename = `clip_${timestamp}.webm`; // Using .webm as a common format for upload
+
+                    // --- Upload to Server ---
+                    const formData = new FormData();
+                    formData.append('video_clip', blob, filename); // 'video_clip' is the field name expected by server
+
+                    try {
+                        const response = await fetch(`${API_BASE_URL}/upload_clip`, {
+                            method: 'POST',
+                            body: formData,
+                            // Browser automatically sets Content-Type: multipart/form-data with boundary
+                        });
+
+                        if (response.ok) {
+                            const result = await response.json();
+                            logStatus(`HOST: Server response: ${result.message}`);
+                        } else {
+                            const errorText = await response.text();
+                            console.error("HOST: Server upload failed:", response.status, errorText);
+                            logStatus(`HOST: Video upload failed: ${response.status} - ${errorText.substring(0, 50)}...`);
+                        }
+                    } catch (error) {
+                        console.error("HOST: Network error during upload:", error);
+                        logStatus(`HOST: Network error during upload: ${error.message}`);
+                    }
+                    // --- End Upload to Server ---
+
+                    // Reset button state
+                    recordButton.textContent = 'Record Video';
+                    recordButton.classList.remove('recording');
+                };
+
+                mediaRecorder.start();
+                logStatus("HOST: Recording started (max 30 seconds).");
+                recordButton.textContent = 'Stop Recording';
+                recordButton.classList.add('recording');
+
+                // Set 30-second timeout for automatic stop
+                recordingTimeout = setTimeout(() => {
+                    if (mediaRecorder.state === 'recording') {
+                        stopRecording();
+                        logStatus("HOST: Recording automatically stopped after 30 seconds.");
+                    }
+                }, 30000); // 30 seconds
+            } catch (error) {
+                console.error("HOST: Error starting recording:", error);
+                logStatus(`HOST: Failed to start recording: ${error.message}`);
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                clearTimeout(recordingTimeout); // Clear the auto-stop timeout
+            } else {
+                logStatus("HOST: No active recording to stop.");
+            }
+        }
+        // --- End Recording Functionality ---
+
+
+        // Event Listeners for buttons
+        startButton.onclick = () => startCamera();
+        stopButton.onclick = stopCamera;
+        switchCameraButton.onclick = switchCamera;
+        recordButton.onclick = () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                stopRecording();
+            } else {
+                startRecording();
             }
         };
+
 
         function setupPeerConnection() {
             if (pc && pc.connectionState !== 'closed') {
                 pc.close();
             }
             pc = new RTCPeerConnection(configuration);
-            logStatus("PeerConnection (re)initialized.");
+            logStatus("HOST: PeerConnection (re)initialized.");
 
             if (localStream) {
+                // Add current tracks to the new PeerConnection
                 localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-                logStatus("Local stream tracks added to PeerConnection.");
+                logStatus("HOST: Local stream tracks added to PeerConnection.");
             } else {
-                logStatus("Warning: setupPeerConnection called but localStream is not available.");
+                logStatus("HOST: Warning: setupPeerConnection called but localStream is not available. Start camera first.");
             }
 
             pc.onicecandidate = event => {
                 if (event.candidate) {
-                    logStatus("Sending ICE candidate to viewer.");
+                    logStatus("HOST: Sending ICE candidate to viewer.");
                     // Serialize the RTCIceCandidate object to a plain JSON object
                     signalingSocket.send(JSON.stringify({ type: 'candidate', candidate: event.candidate.toJSON(), from: 'host' }));
                 }
             };
 
             pc.onconnectionstatechange = () => {
-                logStatus(`Connection state: ${pc.connectionState}`);
+                logStatus(`HOST: Connection state: ${pc.connectionState}`);
                 if (pc.connectionState === "connected") {
-                    logStatus("Connected to Viewer! 🎉 Streaming...");
+                    logStatus("HOST: Connected to Viewer! 🎉 Streaming...");
                 } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-                    logStatus("Disconnected or failed. Viewer may need to re-signal readiness or host may need to restart stream.");
+                    logStatus("HOST: Disconnected or failed. Viewer may need to re-signal readiness or host may need to restart stream.");
                     // Aggressively try to reconnect by resetting and signaling readiness.
                     // This might cause loops if the issue is persistent, but good for a local demo.
                     // setupPeerConnection(); // Re-initialize PC
@@ -228,34 +480,34 @@
 
         async function createAndSendOffer() {
             if (!pc || !localStream) {
-                logStatus("Cannot create offer: PeerConnection or local stream not ready.");
-                if (!pc) logStatus("Reason: PeerConnection is null or not initialized.");
-                if (!localStream) logStatus("Reason: Local camera stream is not available.");
+                logStatus("HOST: Cannot create offer: PeerConnection or local stream not ready.");
+                if (!pc) logStatus("HOST: Reason: PeerConnection is null or not initialized.");
+                if (!localStream) logStatus("HOST: Reason: Local camera stream is not available.");
                 return;
             }
-            // Ensure tracks are added if not already
+            // Ensure tracks are added if not already (important if PC was re-initialized)
             if (pc.getSenders().length === 0 && localStream) {
-                 logStatus("Adding tracks before creating offer (should have been done in setupPeerConnection).");
+                 logStatus("HOST: Adding tracks before creating offer (should have been done in setupPeerConnection).");
                  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
             }
 
-            logStatus("Creating offer...");
+            logStatus("HOST: Creating offer...");
             try {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
                 // Serialize the RTCSessionDescription object to a plain JSON object
                 signalingSocket.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.toJSON(), from: 'host' }));
-                logStatus("Offer sent to viewer.");
+                logStatus("HOST: Offer sent to viewer.");
             } catch (error) {
                 console.error("HOST: Error creating offer:", error);
-                logStatus(`Error creating offer: ${error.message}`);
+                logStatus(`HOST: Error creating offer: ${error.message}`);
             }
         }
 
         window.onload = () => {
-            logStatus("Host page loaded. Initializing WebSocket connection...");
+            logStatus("HOST: Host page loaded. Initializing WebSocket connection...");
             initSignalingSocket();
-            logStatus("Waiting for 'Start Camera' or viewer signals.");
+            logStatus("HOST: Waiting for 'Start Camera' or viewer signals.");
         };
 
         // Optional: Clean up when the window is closed
@@ -269,6 +521,11 @@
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());
             }
+            // Ensure recording is stopped and timeout cleared on unload
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+            clearTimeout(recordingTimeout);
         });
     </script>
 </body>
