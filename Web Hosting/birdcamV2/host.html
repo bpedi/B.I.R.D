@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Host Camera - Automated</title>
+    <style>
+        body { font-family: 'Inter', sans-serif; margin: 20px; background-color: #f0f0f0; display: flex; justify-content: center; align-items: center; min-height: 90vh; }
+        .container { background-color: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; }
+        h1 { color: #333; margin-bottom: 20px; font-size: 1.8em; }
+        #localVideo { border: 2px solid #ddd; width: 100%; max-width: 320px; height: 240px; background-color: #000; border-radius: 8px; margin-bottom: 20px; display: block; margin-left: auto; margin-right: auto; }
+        button {
+            padding: 12px 25px;
+            font-size: 1.1em;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            transition: background-color 0.3s ease, transform 0.2s ease;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        .status { margin-top: 20px; font-style: italic; color: #555; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Camera Host (Auto-Connect)</h1>
+        <video id="localVideo" autoplay muted playsinline></video><br>
+        <button id="startButton">Start Camera & Stream</button>
+        <div id="status" class="status">Status: Idle</div>
+    </div>
+
+    <script>
+        const localVideo = document.getElementById('localVideo');
+        const startButton = document.getElementById('startButton');
+        const statusDiv = document.getElementById('status');
+
+        let localStream;
+        let pc; // PeerConnection
+        let signalingSocket; // WebSocket for signaling
+        let viewerIsWaiting = false; // Flag to track if viewer is ready
+
+        // IMPORTANT: Replace 'YOUR_COMPUTERS_IP_ADDRESS' with your actual local IP (e.g., 192.168.1.100)
+        // Ensure this matches the IP your phone will use to access the server.
+        const SIGNALING_SERVER_IP = '192.168.1.163'; 
+        const SIGNALING_SERVER_PORT = 8001; // This is the port for the WebSocket server
+
+        // Use 'wss://' because your HTML page is served over HTTPS
+        const signalingServerUrl = `wss://${SIGNALING_SERVER_IP}:${SIGNALING_SERVER_PORT}`;
+
+        const configuration = {
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        };
+
+        function logStatus(msg) {
+            console.log(`HOST: ${msg}`);
+            statusDiv.textContent = `Status: ${msg}`;
+        }
+
+        // Initialize WebSocket connection
+        function initSignalingSocket() {
+            if (signalingSocket && (signalingSocket.readyState === WebSocket.OPEN || signalingSocket.readyState === WebSocket.CONNECTING)) {
+                logStatus("WebSocket already connected or connecting.");
+                return;
+            }
+
+            signalingSocket = new WebSocket(signalingServerUrl);
+
+            signalingSocket.onopen = () => {
+                logStatus("Connected to signaling server.");
+            };
+
+            signalingSocket.onmessage = async (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    // Ignore messages sent by self (if 'from' field is added and matches)
+                    if (message.from === 'host') return;
+
+                    logStatus(`Received message type: ${message.type}`);
+
+                    // Ensure PC is ready before processing most messages
+                    if (!pc || pc.signalingState === 'closed') {
+                        if (message.type === 'offer') { // Only re-setup for offer if closed
+                            logStatus("PC was closed. Re-initializing for new offer.");
+                            setupPeerConnection();
+                        } else if (message.type !== 'viewer_ready') { // For other messages, if pc is closed, maybe ignore
+                            logStatus(`PC is closed. Ignoring message type: ${message.type}`);
+                            return;
+                        }
+                    }
+
+                    switch (message.type) {
+                        case 'viewer_ready':
+                            // If camera is already active and PC is ready, send offer immediately
+                            if (localStream && pc && (pc.signalingState === 'stable' || pc.signalingState === 'have-local-offer')) {
+                                logStatus("Viewer is ready. Camera and PC active. Creating/Resending offer.");
+                                await createAndSendOffer();
+                            } else if (localStream && pc && pc.signalingState === 'closed') {
+                                logStatus("Viewer is ready. PC was closed. Re-initializing PC and sending offer.");
+                                setupPeerConnection();
+                                await createAndSendOffer();
+                            } else if (localStream && !pc) { // Stream exists but PC not set up
+                                logStatus("Viewer is ready. Camera active but PC not set up. Setting up PC and sending offer.");
+                                setupPeerConnection();
+                                await createAndSendOffer();
+                            } else { // Camera not started yet
+                                logStatus("Viewer is ready, but host camera not active yet. Will send offer once camera starts.");
+                                viewerIsWaiting = true;
+                            }
+                            break;
+                        case 'answer':
+                            if (pc && pc.signalingState === "have-local-offer") {
+                                logStatus("Received answer. Setting remote description...");
+                                try {
+                                    await pc.setRemoteDescription(new RTCSessionDescription(message.sdp));
+                                    logStatus("Remote description set successfully.");
+                                } catch (error) {
+                                    console.error("HOST: Error setting remote description:", error);
+                                    logStatus(`Error setting remote description: ${error.message}`);
+                                }
+                            } else {
+                                logStatus(`Ignoring answer. PC state is not 'have-local-offer'. Current state: ${pc ? pc.signalingState : 'PC is null'}`);
+                            }
+                            break;
+                        case 'candidate':
+                            if (message.candidate && pc && pc.signalingState !== 'closed') {
+                                logStatus("Received ICE candidate from viewer. Adding it.");
+                                try {
+                                    // Reconstruct RTCIceCandidate from plain object
+                                    await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                                } catch (error) {
+                                    if (!error.message.includes("candidate can no longer be gathered") && !error.message.includes("The RTCPeerConnection's signalingState is 'closed'")) {
+                                        console.warn("HOST: Error adding received ICE candidate:", error);
+                                    }
+                                }
+                            }
+                            break;
+                    }
+                } catch (error) {
+                    console.error("HOST: Error parsing or handling WebSocket message:", error);
+                }
+            };
+
+            signalingSocket.onerror = (error) => {
+                console.error("HOST: WebSocket Error:", error);
+                logStatus("Error connecting to signaling server. Check console.");
+            };
+
+            signalingSocket.onclose = (event) => {
+                console.log("HOST: WebSocket closed:", event);
+                logStatus(`Disconnected from signaling server. Code: ${event.code}, Reason: ${event.reason}. Reconnecting in 3s...`);
+                // Simple reconnect logic
+                setTimeout(initSignalingSocket, 3000);
+            };
+        }
+
+        startButton.onclick = async () => {
+            logStatus("Requesting camera access...");
+            try {
+                if (localStream) { // If already streaming, stop old tracks before getting new ones
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+                logStatus("Camera active.");
+
+                setupPeerConnection(); // Initialize/re-initialize PC with the new stream
+
+                if (viewerIsWaiting) {
+                    logStatus("Viewer was already waiting. Creating and sending offer now.");
+                    await createAndSendOffer();
+                    viewerIsWaiting = false; // Reset flag
+                } else {
+                    logStatus("Host ready. Waiting for viewer to signal readiness.");
+                }
+
+            } catch (error) {
+                console.error("HOST: Error accessing media devices.", error);
+                logStatus(`Error: ${error.message}. Ensure camera permissions are granted.`);
+            }
+        };
+
+        function setupPeerConnection() {
+            if (pc && pc.connectionState !== 'closed') {
+                pc.close();
+            }
+            pc = new RTCPeerConnection(configuration);
+            logStatus("PeerConnection (re)initialized.");
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                logStatus("Local stream tracks added to PeerConnection.");
+            } else {
+                logStatus("Warning: setupPeerConnection called but localStream is not available.");
+            }
+
+            pc.onicecandidate = event => {
+                if (event.candidate) {
+                    logStatus("Sending ICE candidate to viewer.");
+                    // Serialize the RTCIceCandidate object to a plain JSON object
+                    signalingSocket.send(JSON.stringify({ type: 'candidate', candidate: event.candidate.toJSON(), from: 'host' }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                logStatus(`Connection state: ${pc.connectionState}`);
+                if (pc.connectionState === "connected") {
+                    logStatus("Connected to Viewer! 🎉 Streaming...");
+                } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+                    logStatus("Disconnected or failed. Viewer may need to re-signal readiness or host may need to restart stream.");
+                    // Aggressively try to reconnect by resetting and signaling readiness.
+                    // This might cause loops if the issue is persistent, but good for a local demo.
+                    // setupPeerConnection(); // Re-initialize PC
+                    // if (signalingSocket.readyState === WebSocket.OPEN) {
+                    //     signalingSocket.send(JSON.stringify({ type: 'viewer_ready', from: 'host' })); // Ask for offer again (if host is viewer)
+                    // }
+                }
+            };
+        }
+
+        async function createAndSendOffer() {
+            if (!pc || !localStream) {
+                logStatus("Cannot create offer: PeerConnection or local stream not ready.");
+                if (!pc) logStatus("Reason: PeerConnection is null or not initialized.");
+                if (!localStream) logStatus("Reason: Local camera stream is not available.");
+                return;
+            }
+            // Ensure tracks are added if not already
+            if (pc.getSenders().length === 0 && localStream) {
+                 logStatus("Adding tracks before creating offer (should have been done in setupPeerConnection).");
+                 localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            }
+
+            logStatus("Creating offer...");
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                // Serialize the RTCSessionDescription object to a plain JSON object
+                signalingSocket.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.toJSON(), from: 'host' }));
+                logStatus("Offer sent to viewer.");
+            } catch (error) {
+                console.error("HOST: Error creating offer:", error);
+                logStatus(`Error creating offer: ${error.message}`);
+            }
+        }
+
+        window.onload = () => {
+            logStatus("Host page loaded. Initializing WebSocket connection...");
+            initSignalingSocket();
+            logStatus("Waiting for 'Start Camera' or viewer signals.");
+        };
+
+        // Optional: Clean up when the window is closed
+        window.addEventListener('beforeunload', () => {
+            if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+                signalingSocket.close();
+            }
+            if (pc) {
+                pc.close();
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+        });
+    </script>
+</body>
+</html>
