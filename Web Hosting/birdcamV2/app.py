@@ -1,10 +1,10 @@
-import http.server
+import asyncio
+from aiohttp import web
 import ssl
-import socketserver
 import os
-import cgi # For parsing multipart/form-data
-import datetime # For timestamping filenames
-import logging # For server-side logging
+import datetime
+import logging
+import json
 
 # Configure logging for the server
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,83 +17,93 @@ KEYFILE = "key.pem"    # Your SSL private key file (e.g., 'key.pem')
 CLIPS_DIR = "clips"    # Directory to save recorded clips
 # --------------------
 
-class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
+async def handle_static(request):
     """
-    A custom handler to serve files and handle video uploads.
+    Handles serving static files (HTML, JS, CSS).
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=DIRECTORY, **kwargs)
-
-    def do_POST(self):
-        """
-        Handles POST requests, specifically for video clip uploads.
-        """
-        if self.path == '/upload_clip':
-            self.handle_upload_clip()
+    filepath = os.path.join(DIRECTORY, request.path.lstrip('/'))
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        # Fallback to index.html for root or if file not found directly
+        if request.path == '/' or not os.path.exists(filepath):
+            filepath = os.path.join(DIRECTORY, 'host.html') # Or index.html if you have one
+            if not os.path.exists(filepath):
+                raise web.HTTPNotFound()
         else:
-            self.send_error(404, "Not Found")
+            raise web.HTTPNotFound()
 
-    def handle_upload_clip(self):
-        """
-        Processes the uploaded video clip and saves it to the CLIPS_DIR.
-        """
-        logging.info("Received POST request for /upload_clip")
-        content_type = self.headers.get('Content-Type')
+    return web.FileResponse(filepath)
 
-        if not content_type:
-            self.send_error(400, "Content-Type header is missing")
-            return
+async def upload_clip(request):
+    """
+    Handles POST requests for video clip uploads.
+    """
+    logging.info("Received POST request for /upload_clip")
+    
+    # Check if the request content type is multipart/form-data
+    if not request.content_type.startswith('multipart/form-data'):
+        logging.warning(f"Unsupported Content-Type for upload: {request.content_type}")
+        raise web.HTTPUnsupportedMediaType(reason="Content-Type must be multipart/form-data")
 
-        # Use cgi.FieldStorage to parse multipart/form-data
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': content_type},
-            keep_blank_values=True
-        )
+    reader = await request.multipart() # Get the multipart reader
 
-        try:
-            if 'video_clip' in form:
-                file_item = form['video_clip']
-                if file_item.file:
-                    # Ensure the clips directory exists
-                    os.makedirs(CLIPS_DIR, exist_ok=True)
+    # 'video_clip' is the field name used in host.html's FormData
+    field = await reader.next()
+    if field is None or field.name != 'video_clip':
+        logging.warning("Missing 'video_clip' field in multipart form data.")
+        raise web.HTTPBadRequest(reason="Missing 'video_clip' field")
 
-                    # Generate a timestamped filename
-                    now = datetime.datetime.now()
-                    timestamp = now.strftime("%Y%m%d_%H%M%S")
-                    # Get file extension from the original filename or infer from Content-Type
-                    # For MediaRecorder, it's often video/webm or video/mp4
-                    file_extension = ".webm" # Default to webm, adjust if your MediaRecorder uses mp4
-                    if file_item.type == 'video/mp4':
-                        file_extension = ".mp4"
-                    elif file_item.type == 'video/webm':
-                        file_extension = ".webm"
-                    
-                    filename = f"clip_{timestamp}{file_extension}"
-                    file_path = os.path.join(CLIPS_DIR, filename)
+    if not field.filename:
+        logging.warning("No filename provided for uploaded clip.")
+        raise web.HTTPBadRequest(reason="No filename provided for clip")
 
-                    # Save the file
-                    with open(file_path, 'wb') as f:
-                        f.write(file_item.file.read())
-                    
-                    logging.info(f"Successfully saved clip: {file_path}")
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    response_data = json.dumps({"status": "success", "message": f"Clip saved as {filename}"})
-                    self.wfile.write(response_data.encode('utf-8'))
-                else:
-                    self.send_error(400, "No file uploaded or file is empty")
-            else:
-                self.send_error(400, "Missing 'video_clip' field in form data")
-        except Exception as e:
-            logging.error(f"Error processing upload: {e}", exc_info=True)
-            self.send_error(500, f"Internal Server Error: {e}")
+    # Ensure the clips directory exists
+    os.makedirs(CLIPS_DIR, exist_ok=True)
 
-def run_https_server():
-    # Create an SSL context
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Generate a timestamped filename
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    # Infer file extension from Content-Type or original filename
+    file_extension = ".webm" # Default
+    if field.headers.get('Content-Type') == 'video/mp4':
+        file_extension = ".mp4"
+    elif field.headers.get('Content-Type') == 'video/webm':
+        file_extension = ".webm"
+    elif '.' in field.filename: # Try to get from original filename if available
+        ext = os.path.splitext(field.filename)[1]
+        if ext:
+            file_extension = ext
+
+    filename = f"clip_{timestamp}{file_extension}"
+    file_path = os.path.join(CLIPS_DIR, filename)
+
+    size = 0
+    with open(file_path, 'wb') as f:
+        while True:
+            chunk = await field.read_chunk() # Read chunks of the file
+            if not chunk:
+                break
+            f.write(chunk)
+            size += len(chunk)
+
+    logging.info(f"Successfully saved clip: {file_path} ({size} bytes)")
+    
+    response_data = {"status": "success", "message": f"Clip saved as {filename}"}
+    return web.json_response(response_data)
+
+async def main():
+    """
+    Sets up and runs the aiohttp HTTPS server.
+    """
+    app = web.Application()
+
+    # Define routes
+    app.router.add_get('/', handle_static) # Serve host.html by default
+    app.router.add_get('/{name}', handle_static) # Serve other static files (e.g., host.html, viewer.html)
+    app.router.add_post('/upload_clip', upload_clip) # Handle video uploads
+
+    # Create SSL context
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
     # Check if certificate and key files exist
     if not os.path.exists(CERTFILE):
@@ -106,38 +116,44 @@ def run_https_server():
         return
 
     try:
-        context.load_cert_chain(certfile=CERTFILE, keyfile=KEYFILE)
+        ssl_context.load_cert_chain(certfile=CERTFILE, keyfile=KEYFILE)
     except ssl.SSLError as e:
         logging.critical(f"SSL certificate/key error: {e}")
         logging.critical("Ensure your certificate and key files are valid and correctly formatted.")
         return
 
-    # Create an HTTP server instance using socketserver.TCPServer
-    with socketserver.TCPServer(("", PORT), CustomHTTPRequestHandler) as httpd: # Use CustomHTTPRequestHandler
-        logging.info(f"Serving HTTPS files on port {PORT} from directory '{DIRECTORY}'...")
-        logging.info(f"Video clips will be saved to: {os.path.abspath(CLIPS_DIR)}")
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT, ssl_context=ssl_context)
 
-        try:
-            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    logging.info(f"Serving HTTPS files with aiohttp on port {PORT} from directory '{DIRECTORY}'...")
+    logging.info(f"Video clips will be saved to: {os.path.abspath(CLIPS_DIR)}")
+    logging.info(f"Access your host page at: https://localhost:{PORT}/host.html")
+    logging.info(f"Access your viewer page at: https://localhost:{PORT}/viewer.html")
+    logging.info("\nTo access from your phone or another device:")
+    logging.info("1. Find your computer's local IP address (e.g., 192.168.1.100).")
+    logging.info("2. Ensure your phone is on the SAME Wi-Fi network.")
+    logging.info(f"3. Navigate to: https://YOUR_COMPUTERS_IP_ADDRESS:{PORT}/host.html")
+    logging.info(f"4. Navigate to: https://YOUR_COMPUTERS_IP_ADDRESS:{PORT}/viewer.html")
+    logging.info("\nRemember to bypass the self-signed certificate warning on your phone's browser.")
+    logging.info("Also, ensure your computer's firewall allows incoming connections on port 8000.")
 
-            logging.info(f"Access your host page at: https://localhost:{PORT}/host.html")
-            logging.info(f"Access your viewer page at: https://localhost:{PORT}/viewer.html")
-            logging.info("\nTo access from your phone or another device:")
-            logging.info("1. Find your computer's local IP address (e.g., 192.168.1.100).")
-            logging.info("2. Ensure your phone is on the SAME Wi-Fi network.")
-            logging.info(f"3. Navigate to: https://YOUR_COMPUTERS_IP_ADDRESS:{PORT}/host.html")
-            logging.info(f"4. Navigate to: https://YOUR_COMPUTERS_IP_ADDRESS:{PORT}/viewer.html")
-            logging.info("\nRemember to bypass the self-signed certificate warning on your phone's browser.")
-            logging.info("Also, ensure your computer's firewall allows incoming connections on port 8000.")
-
-            httpd.serve_forever()
-
-        except ssl.SSLError as e:
-            logging.critical(f"SSL configuration error during serve: {e}")
-        except Exception as e:
-            logging.critical(f"An unexpected error occurred: {e}", exc_info=True)
-        finally:
-            logging.info("HTTPS File Server stopped.")
+    try:
+        await site.start()
+        # Keep the server running indefinitely
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        logging.info("Server shutdown initiated.")
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred during server startup: {e}", exc_info=True)
+    finally:
+        await runner.cleanup()
+        logging.info("aiohttp HTTPS File Server stopped.")
 
 if __name__ == "__main__":
-    run_https_server()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("aiohttp HTTPS File Server stopped by user (KeyboardInterrupt).")
+    except Exception as e:
+        logging.critical(f"Failed to start aiohttp HTTPS server: {e}", exc_info=True)
